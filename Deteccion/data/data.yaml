@@ -1,0 +1,5 @@
+train: C:\Users\User\Documents\GitHub\grupo1reto2\Deteccion\data\images\train
+val: C:\Users\User\Documents\GitHub\grupo1reto2\Deteccion\data\images\val
+nc: 1
+names:
+- defecto
