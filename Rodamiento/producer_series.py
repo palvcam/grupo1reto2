@@ -1,31 +1,33 @@
 import json
 import time
 from pathlib import Path
-from collections import deque
-
 import numpy as np
 import pandas as pd
-from kafka import KafkaProducer
 
+from confluent_kafka import Producer
 from scipy.stats import kurtosis, skew
 from scipy.signal import butter, filtfilt, hilbert, welch
 
 import joblib
 
 # ------------------------
-# Config
+# Configuración Kafka
 # ------------------------
-BOOTSTRAP_SERVERS = ["localhost:9092"]
-TOPIC_OUT = "bearing_features_top20"
+BOOTSTRAP_SERVERS = "localhost:9092"
+TOPIC_OUT = "bearing_features"
 
+producer = Producer({"bootstrap.servers": BOOTSTRAP_SERVERS})
+
+# ------------------------
+# Parámetros del modelo
+# ------------------------
 FS = 51200
 window_sec = 0.2
 window_size = int(window_sec * FS)      # 10240
 step = window_size // 2                 # 5120
 
-# Si simulas streaming desde CSV:
-CHUNK_SEC = 0.05                        # tamaño de chunk enviado al "buffer"
-SLEEP_REAL_TIME = False                 # True para simular tiempo real
+CHUNK_SEC = 0.05
+SLEEP_REAL_TIME = False
 
 sensor_names = [
     "tachometer",
@@ -34,20 +36,13 @@ sensor_names = [
     "microphone"
 ]
 
-# Carga de top20 (el mismo fichero que ya guardaste)
-TOP_FEATURES_PATH = "top20_features_windows.joblib"
-top_features = joblib.load(TOP_FEATURES_PATH)
-
-producer = KafkaProducer(
-    bootstrap_servers=BOOTSTRAP_SERVERS,
-    value_serializer=lambda v: json.dumps(v).encode("utf-8")
-)
+# Cargar top20
+top_features = joblib.load("top20_features_windows.joblib")
 
 # ------------------------
-# Utilidades
+# Funciones auxiliares
 # ------------------------
 def rpm_from_filename(p: Path) -> float:
-    # "12.288.csv" -> 12.288 Hz -> 737.28 rpm
     return float(p.stem) * 60.0
 
 def time_feats(x):
@@ -76,8 +71,8 @@ def band_energy(freqs, psd, f0, tol=0.1):
 def order_features(x, fs, fr_hz):
     freqs, psd = welch(x - np.mean(x), fs=fs, nperseg=8192)
     out = {}
-    for o in [1, 2, 3, 4, 5]:
-        out[f"ord_{o}x"] = band_energy(freqs, psd, f0=o*fr_hz, tol=0.05)
+    for o in [1,2,3,4,5]:
+        out[f"ord_{o}x"] = band_energy(freqs, psd, o*fr_hz)
     out["psd_total"] = float(np.trapezoid(psd, freqs))
     return out
 
@@ -92,17 +87,16 @@ def envelope_features(x, fs, fr_hz):
         "env_BPFO": 3.0  * fr_hz,
         "env_BPFI": 5.0  * fr_hz,
     }
-    out = {k: band_energy(freqs, psd, v, tol=0.1) for k, v in targets.items()}
+
+    out = {k: band_energy(freqs, psd, f0) for k, f0 in targets.items()}
     out["env_total"] = float(np.trapezoid(psd, freqs))
     return out
 
-def features_last_window(buffer_df: pd.DataFrame, rpm: float) -> dict:
-    """
-    Extrae features SOLO de la ultima ventana de buffer_df
-    usando acc_over_radial y acc_under_radial, como en entrenamiento.
-    """
+
+def extract_last_window_features(buffer_df, rpm):
+    """ Produce features SOLO de la última ventana """
     if len(buffer_df) < window_size:
-        return {}
+        return None
 
     fr_hz = rpm / 60.0
 
@@ -110,87 +104,70 @@ def features_last_window(buffer_df: pd.DataFrame, rpm: float) -> dict:
     under = buffer_df["acc_under_radial"].to_numpy()[-window_size:]
 
     row = {}
-    row.update({f"acc_over_radial_{k}": v for k, v in time_feats(over).items()})
-    row.update({f"acc_over_radial_{k}": v for k, v in order_features(over, FS, fr_hz).items()})
-    row.update({f"acc_over_radial_{k}": v for k, v in envelope_features(over, FS, fr_hz).items()})
 
-    row.update({f"acc_under_radial_{k}": v for k, v in time_feats(under).items()})
-    row.update({f"acc_under_radial_{k}": v for k, v in order_features(under, FS, fr_hz).items()})
-    row.update({f"acc_under_radial_{k}": v for k, v in envelope_features(under, FS, fr_hz).items()})
+    # Over
+    row.update({f"acc_over_radial_{k}": v for k,v in time_feats(over).items()})
+    row.update({f"acc_over_radial_{k}": v for k,v in order_features(over, FS, fr_hz).items()})
+    row.update({f"acc_over_radial_{k}": v for k,v in envelope_features(over, FS, fr_hz).items()})
 
-    # añade rpm porque está en tus features entrenadas
+    # Under
+    row.update({f"acc_under_radial_{k}": v for k,v in time_feats(under).items()})
+    row.update({f"acc_under_radial_{k}": v for k,v in order_features(under, FS, fr_hz).items()})
+    row.update({f"acc_under_radial_{k}": v for k,v in envelope_features(under, FS, fr_hz).items()})
+
+    # rpm la usabas en entrenamiento
     row["rpm"] = float(rpm)
 
-    # nos quedamos SOLO con top20 (y en el orden correcto)
-    # Si falta alguna, mejor fallar con error explícito:
-    missing = [c for c in top_features if c not in row]
-    if missing:
-        raise ValueError(f"Faltan features top20: {missing}")
+    # filtrar top20
+    row20 = {k: row[k] for k in top_features}
+    return row20
 
-    row_top20 = {k: row[k] for k in top_features}
-    return row_top20
 
 # ------------------------
-# Streaming desde CSV -> buffer -> emite features cada "step"
+# Main streaming
 # ------------------------
-def run_from_csv_folder(root: Path):
+def stream_folder(root: Path):
     files = sorted(root.rglob("*.csv"))
-    if not files:
-        raise RuntimeError(f"No hay CSV en {root}")
-
-    chunk_size = int(CHUNK_SEC * FS)
 
     for csv_path in files:
         df = pd.read_csv(csv_path, header=None, names=sensor_names)
         rpm = rpm_from_filename(csv_path)
         series_id = str(csv_path)
 
-        # buffer (vamos acumulando filas)
         buffer = pd.DataFrame(columns=sensor_names)
-        last_emit_end = 0  # para controlar el "step" de emisión
+        chunk_size = int(CHUNK_SEC * FS)
 
-        n = len(df)
-        for start in range(0, n, chunk_size):
-            end = min(start + chunk_size, n)
-            chunk = df.iloc[start:end]
-            buffer = pd.concat([buffer, chunk], ignore_index=True)
+        for start in range(0, len(df), chunk_size):
+            end = min(start + chunk_size, len(df))
+            buffer = pd.concat([buffer, df.iloc[start:end]], ignore_index=True)
 
-            # mantener buffer acotado (no crecer infinito):
-            # deja margen para poder sacar ultima ventana
+            # evita que el buffer crezca infinito
             if len(buffer) > window_size + step:
                 buffer = buffer.iloc[-(window_size + step):].reset_index(drop=True)
 
-            # si ya podemos emitir, emitimos cada "step"
-            # (cada vez que haya llegado al menos "step" muestras nuevas desde última emisión)
+            # si hay ventana completa, calculamos features
             if len(buffer) >= window_size:
-                # end absoluto en serie original aproximado (no exacto por el recorte)
-                # usamos un contador interno simple:
-                if (end - last_emit_end) >= step:
-                    feat_top20 = features_last_window(buffer, rpm=rpm)
+                feats = extract_last_window_features(buffer, rpm)
+                if feats is None:
+                    continue
 
-                    payload = {
-                        "series_id": series_id,
-                        "rpm": float(rpm),
-                        "fs": FS,
-                        "window_sec": window_sec,
-                        "window_size": window_size,
-                        "step": step,
-                        "chunk_end_sample": int(end),
-                        "features_top20": feat_top20,
-                        "feature_order": top_features  # útil para debug
-                    }
+                payload = {
+                    "series_id": series_id,
+                    "rpm": float(rpm),
+                    "features_top20": feats
+                }
 
-                    producer.send(TOPIC_OUT, payload)
-                    producer.flush()
-                    last_emit_end = end
+                producer.produce(TOPIC_OUT, value=json.dumps(payload))
+                producer.poll(0)
 
             if SLEEP_REAL_TIME:
-                time.sleep((end - start) / FS)
+                time.sleep(len(df.iloc[start:end]) / FS)
 
-        print(f"[OK] Enviado features top20 para: {csv_path}")
+        print("[OK] Enviado:", csv_path)
+
+    producer.flush()
+
 
 if __name__ == "__main__":
-    # carpeta desde la que simulas streaming
-    root = Path.cwd() / "bearing_fault_detection_reduced" / "normal"  # cambia a lo que quieras
-    run_from_csv_folder(root)
-
+    root = Path.cwd() / "bearing_fault_detection_reduced" / "normal"
+    stream_folder(root)
