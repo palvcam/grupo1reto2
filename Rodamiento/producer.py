@@ -5,40 +5,45 @@ import os
 from pathlib import Path
 import numpy as np
 from scipy.stats import kurtosis, skew
+from scipy.signal import butter, filtfilt, hilbert, welch
 from datetime import datetime
 import csv
 import time
+import joblib
+import random
 
 # Configuración del productor
 producer_config = {
-    'bootstrap.servers': 'localhost:9092',
+    'bootstrap.servers': '127.0.0.1:9092',
 }
 producer = Producer(producer_config)
 
-# Crear carpetas Bronze
-os.makedirs("datalake/bronze", exist_ok=True)
 
-bronze_raw_data_file = open("datalake/bronze/raw_data.csv", "a", newline="")
+# ------------------------
+# Datalake
+# ------------------------
+
+# Crear carpetas Bronze
+os.makedirs("datalake/raw", exist_ok=True)
+
+RAW_DATA_FILE = Path("datalake/raw/raw_data.csv")
 
 writer_raw_data = None
 
-
 PATH = Path.cwd()
-
 DATA_DIR = Path("production")
 
-def temporal_features(signal):
-    return {
-        "mean": np.mean(signal),
-        "std": np.std(signal),
-        "rms": np.sqrt(np.mean(signal**2)),
-        "max": np.max(signal),
-        "min": np.min(signal),
-        "ptp": np.ptp(signal),
-        "kurtosis": kurtosis(signal),
-        "skewness": skew(signal),
-        "zero_crossings": np.sum(np.diff(np.sign(signal)) != 0)
-    }
+# ------------------------
+# Parámetros del modelo
+# ------------------------
+FS = 51200
+window_sec = 0.2
+window_size = int(window_sec * FS)      # 10240
+step = window_size // 2                 # 5120
+
+CHUNK_SEC = 0.05
+SLEEP_REAL_TIME = False
+
 
 # Nombres de los sensores (en el orden correcto)
 sensor_names = [
@@ -52,58 +57,151 @@ sensor_names = [
     "microphone"
 ]
 
-def extract_features_from_csv(csv_file: Path) -> pd.DataFrame:
-    # Cargar CSV SIN header y asignar nombres de sensores
-    signal = pd.read_csv(csv_file, header=None, names=sensor_names)
-    
-    # Diccionario donde guardaremos todas las features
-    all_feats = {}
+# Cargar top20
+top_features = joblib.load("top20_features_windows.joblib")
 
-    for sensor in sensor_names:
-        feats = temporal_features(signal[sensor].values)
-        # Redondeamos a 6 decimales y añadimos prefijo del sensor
-        for k, v in feats.items():
-            all_feats[f"{sensor}_{k}"] = round(float(v), 6)
+# ------------------------
+# Funciones auxiliares
+# ------------------------
+def rpm_from_filename(p: Path) -> float:
+    return float(p.stem) * 60.0
 
-    # Creamos un DataFrame de 1 fila con todas las features
-    df_features = pd.DataFrame([all_feats])
-    return df_features
+def time_feats(x):
+    x = np.asarray(x)
+    rms = np.sqrt(np.mean(x**2))
+    return {
+        "rms": float(rms),
+        "std": float(np.std(x)),
+        "mean": float(np.mean(x)),
+        "kurtosis": float(kurtosis(x, fisher=False)),
+        "skew": float(skew(x)),
+        "crest_factor": float(np.max(np.abs(x)) / (rms + 1e-12)),
+        "ptp": float(np.ptp(x)),
+    }
 
-def prepare_message(csv_file: Path) -> pd.DataFrame:
-    df_features = extract_features_from_csv(csv_file)
-    frequency_value = csv_file.stem
-    df_features.insert(0, "frequency(Hz)", frequency_value)
-    df_features["produced_timestamp"] = datetime.now().isoformat()
+def bandpass(x, fs, low, high, order=4):
+    b, a = butter(order, [low/(fs/2), high/(fs/2)], btype="band")
+    return filtfilt(b, a, x)
 
-    return df_features
+def band_energy(freqs, psd, f0, tol=0.1):
+    mask = (freqs >= f0*(1-tol)) & (freqs <= f0*(1+tol))
+    if np.any(mask):
+        return float(np.trapezoid(psd[mask], freqs[mask]))
+    return 0.0
+
+def order_features(x, fs, fr_hz):
+    freqs, psd = welch(x - np.mean(x), fs=fs, nperseg=8192)
+    out = {}
+    for o in [1,2,3,4,5]:
+        out[f"ord_{o}x"] = band_energy(freqs, psd, o*fr_hz)
+    out["psd_total"] = float(np.trapezoid(psd, freqs))
+    return out
+
+def envelope_features(x, fs, fr_hz):
+    xf = bandpass(x - np.mean(x), fs, low=500, high=8000)
+    env = np.abs(hilbert(xf))
+    freqs, psd = welch(env, fs=fs, nperseg=8192)
+
+    targets = {
+        "env_FTF": 0.375 * fr_hz,
+        "env_BSF": 1.87  * fr_hz,
+        "env_BPFO": 3.0  * fr_hz,
+        "env_BPFI": 5.0  * fr_hz,
+    }
+
+    out = {k: band_energy(freqs, psd, f0) for k, f0 in targets.items()}
+    out["env_total"] = float(np.trapezoid(psd, freqs))
+    return out
+
+
+def extract_last_window_features(buffer_df, rpm):
+    """ Produce features SOLO de la última ventana """
+    if len(buffer_df) < window_size:
+        return None
+
+    fr_hz = rpm / 60.0
+
+    over = buffer_df["acc_over_radial"].to_numpy()[-window_size:]
+    under = buffer_df["acc_under_radial"].to_numpy()[-window_size:]
+
+    row = {}
+
+    # Over
+    row.update({f"acc_over_radial_{k}": v for k,v in time_feats(over).items()})
+    row.update({f"acc_over_radial_{k}": v for k,v in order_features(over, FS, fr_hz).items()})
+    row.update({f"acc_over_radial_{k}": v for k,v in envelope_features(over, FS, fr_hz).items()})
+
+    # Under
+    row.update({f"acc_under_radial_{k}": v for k,v in time_feats(under).items()})
+    row.update({f"acc_under_radial_{k}": v for k,v in order_features(under, FS, fr_hz).items()})
+    row.update({f"acc_under_radial_{k}": v for k,v in envelope_features(under, FS, fr_hz).items()})
+
+    # rpm la usabas en entrenamiento
+    row["rpm"] = float(rpm)
+
+    # filtrar top20
+    row20 = {k: row[k] for k in top_features}
+    return row20
+
 
 def delivery_report(err, msg):
     if err:
         print(f"Error al enviar mensaje: {err}")
     else:
-        print(f"Mensaje enviado: {msg.key()}")
+        print(f"Mensaje entregado al topic '{msg.topic()}'")
 
-n = 1
-# Loop del producer
-for csv_file in DATA_DIR.glob("*.csv"):
-    row_df = prepare_message(csv_file)
 
-    row = row_df.iloc[0].to_dict() 
+if __name__ == "__main__":
+    counter = 1
+    try:
+        # Loop del producer
+        all_csv = list(DATA_DIR.glob("*.csv"))
+        random.shuffle(all_csv)
 
-    if writer_raw_data is None:
-        writer_raw_data = csv.DictWriter(bronze_raw_data_file, fieldnames=row.keys())
-        if not os.path.exists(bronze_raw_data_file):
-            writer_raw_data.writeheader()
-    writer_raw_data.writerow(row)
+        for csv_path in all_csv:
+            df = pd.read_csv(csv_path, header=None, names=sensor_names)
+            frequency = csv_path.stem
+            rpm = round(rpm_from_filename(csv_path), 5)
 
-    print(f"Medición {n}")
-    print(f"   - Frequency(Hz): {csv_file.stem}")
-    n += 1
+            feats = extract_last_window_features(df, rpm)  # Solo la última ventana
+            if feats is not None:
+                    produced_timestamp = datetime.now().isoformat()
 
-    # Publicar en Kafka
-    producer.produce("rodamientos", json.dumps(row).encode("utf-8"))
-    time.sleep(1)
+                    payload = {
+                        "frequency(Hz)": frequency,
+                        "rpm": float(rpm),
+                        "produced_timestamp": produced_timestamp,
+                        **feats  # aplanamos aquí
+                    }
 
-    producer.flush()
+                    print(f"Medición {counter}")
+                    print(f"   - Frecuencia del motor (Hz): {csv_path.stem}")
+                    print(f"   - RPM: {rpm}")
+                    print(f"   - Fecha producida: {produced_timestamp}")
+                    counter += 1
 
-bronze_raw_data_file.close()
+                    # Publicar en Kafka
+                    producer.produce(
+                        "rodamientos",
+                        value=json.dumps(payload).encode("utf-8"),
+                        callback=delivery_report)
+                    producer.poll(0)
+                    producer.flush()
+
+                    print("-" * 60)
+
+                    # Escritura en Datalake
+                    write_header = not RAW_DATA_FILE.exists() or RAW_DATA_FILE.stat().st_size == 0
+
+                    with open(RAW_DATA_FILE, "a", newline="") as f:
+                        writer_raw_data = csv.DictWriter(f, fieldnames=payload.keys())
+                        # Escribir header solo si el archivo no existía antes
+                        if write_header:
+                            writer_raw_data.writeheader()
+                        # Escribir la fila
+                        writer_raw_data.writerow(payload)
+
+            time.sleep(0.5)
+
+    except KeyboardInterrupt:
+        print("\n[Producer] Parado por consola (Ctrl+C).")
