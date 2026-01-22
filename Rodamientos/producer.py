@@ -1,22 +1,37 @@
+from confluent_kafka import Producer
+import pandas as pd
 import json
-import time
+import os
 from pathlib import Path
 import numpy as np
-import pandas as pd
-
-from confluent_kafka import Producer
 from scipy.stats import kurtosis, skew
 from scipy.signal import butter, filtfilt, hilbert, welch
-
+from datetime import datetime
+import csv
+import time
 import joblib
+import random
+
+# Configuración del productor
+producer_config = {
+    'bootstrap.servers': '127.0.0.1:9092',
+}
+producer = Producer(producer_config)
+
 
 # ------------------------
-# Configuración Kafka
+# Datalake
 # ------------------------
-BOOTSTRAP_SERVERS = "localhost:9092"
-TOPIC_OUT = "bearing_features"
 
-producer = Producer({"bootstrap.servers": BOOTSTRAP_SERVERS})
+# Crear carpetas Bronze
+os.makedirs("datalake/raw", exist_ok=True)
+
+RAW_DATA_FILE = Path("datalake/raw/raw_data.csv")
+
+writer_raw_data = None
+
+PATH = Path.cwd()
+DATA_DIR = Path("production")
 
 # ------------------------
 # Parámetros del modelo
@@ -29,10 +44,16 @@ step = window_size // 2                 # 5120
 CHUNK_SEC = 0.05
 SLEEP_REAL_TIME = False
 
+
+# Nombres de los sensores (en el orden correcto)
 sensor_names = [
     "tachometer",
-    "acc_under_axial","acc_under_radial","acc_under_tangential",
-    "acc_over_axial","acc_over_radial","acc_over_tangential",
+    "acc_under_axial",
+    "acc_under_radial",
+    "acc_under_tangential",
+    "acc_over_axial",
+    "acc_over_radial",
+    "acc_over_tangential",
     "microphone"
 ]
 
@@ -123,51 +144,65 @@ def extract_last_window_features(buffer_df, rpm):
     return row20
 
 
-# ------------------------
-# Main streaming
-# ------------------------
-def stream_folder(root: Path):
-    files = sorted(root.rglob("*.csv"))
-
-    for csv_path in files:
-        df = pd.read_csv(csv_path, header=None, names=sensor_names)
-        rpm = rpm_from_filename(csv_path)
-        series_id = str(csv_path)
-
-        buffer = pd.DataFrame(columns=sensor_names)
-        chunk_size = int(CHUNK_SEC * FS)
-
-        for start in range(0, len(df), chunk_size):
-            end = min(start + chunk_size, len(df))
-            buffer = pd.concat([buffer, df.iloc[start:end]], ignore_index=True)
-
-            # evita que el buffer crezca infinito
-            if len(buffer) > window_size + step:
-                buffer = buffer.iloc[-(window_size + step):].reset_index(drop=True)
-
-            # si hay ventana completa, calculamos features
-            if len(buffer) >= window_size:
-                feats = extract_last_window_features(buffer, rpm)
-                if feats is None:
-                    continue
-
-                payload = {
-                    "series_id": series_id,
-                    "rpm": float(rpm),
-                    "features_top20": feats
-                }
-
-                producer.produce(TOPIC_OUT, value=json.dumps(payload))
-                producer.poll(0)
-
-            if SLEEP_REAL_TIME:
-                time.sleep(len(df.iloc[start:end]) / FS)
-
-        print("[OK] Enviado:", csv_path)
-
-    producer.flush()
+def delivery_report(err, msg):
+    if err:
+        print(f"Error al enviar mensaje: {err}")
+    else:
+        print(f"Mensaje entregado al topic '{msg.topic()}'")
 
 
 if __name__ == "__main__":
-    root = Path.cwd() / "bearing_fault_detection_reduced" / "normal"
-    stream_folder(root)
+    counter = 1
+    try:
+        # Loop del producer
+        all_csv = list(DATA_DIR.glob("*.csv"))
+        random.shuffle(all_csv)
+
+        for csv_path in all_csv:
+            df = pd.read_csv(csv_path, header=None, names=sensor_names)
+            frequency = csv_path.stem
+            rpm = rpm_from_filename(csv_path)
+            rpm = round(rpm, 5)
+
+            feats = extract_last_window_features(df, rpm)  # Solo la última ventana
+            if feats is not None:
+                    produced_timestamp = datetime.now().isoformat()
+
+                    payload = {
+                        "frequency(Hz)": frequency,
+                        "rpm": float(rpm),
+                        "produced_timestamp": produced_timestamp,
+                        **feats  # aplanamos aquí
+                    }
+
+                    print(f"Medición {counter}")
+                    print(f"   - Frecuencia del motor (Hz): {csv_path.stem}")
+                    print(f"   - RPM: {rpm}")
+                    print(f"   - Fecha producida: {produced_timestamp}")
+                    counter += 1
+
+                    # Publicar en Kafka
+                    producer.produce(
+                        "rodamientos",
+                        value=json.dumps(payload).encode("utf-8"),
+                        callback=delivery_report)
+                    producer.poll(0)
+
+                    print("-" * 60)
+
+                    # Escritura en Datalake
+                    write_header = not RAW_DATA_FILE.exists() or RAW_DATA_FILE.stat().st_size == 0
+
+                    with open(RAW_DATA_FILE, "a", newline="") as f:
+                        writer_raw_data = csv.DictWriter(f, fieldnames=payload.keys())
+                        # Escribir header solo si el archivo no existía antes
+                        if write_header:
+                            writer_raw_data.writeheader()
+                        # Escribir la fila
+                        writer_raw_data.writerow(payload)
+
+            producer.flush()
+            time.sleep(0.5)
+
+    except KeyboardInterrupt:
+        print("\n[Producer] Parado por consola (Ctrl+C).")

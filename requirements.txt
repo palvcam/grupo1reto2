@@ -1,0 +1,12 @@
+confluent-kafka
+pandas
+numpy
+scipy
+joblib
+ultralytics
+matplotlib
+scikit-learn
+opencv-python
+PyYAML
+
+

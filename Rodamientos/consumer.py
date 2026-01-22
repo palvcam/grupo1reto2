@@ -56,6 +56,20 @@ writer_bf = None
 writer_cf = None
 writer_or = None
 
+# Cargar CSV de etiquetas de test
+test_labels_file = Path("test_labels.csv")
+test_labels = {}
+with open(test_labels_file, newline="") as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        # Guardamos como {frequency: fault_type}
+        test_labels[row["frequency"]] = row["fault_type"]
+
+# Diccionario para llevar conteo de predicciones correctas
+prediction_results = {
+    "total": 0,
+    "correct": 0
+}
 
 def prepare_message(message):
     """Prepara el mensaje para predicción"""
@@ -65,7 +79,6 @@ def prepare_message(message):
     df_temp.insert(6, "rpm", rpm_col)
 
     return df_temp
-
 
 if __name__ == "__main__":
     print("Consumer iniciado. Leyendo del topic 'rodamientos'")
@@ -100,6 +113,14 @@ if __name__ == "__main__":
                     
                 data["prediction_timestamp"] = datetime.now().isoformat()
                 data["fault_type"] = fault_prediction
+
+                frequency = data["frequency(Hz)"]
+
+                # Comprobamos si la frecuencia está en el CSV de test
+                if frequency in test_labels:
+                    prediction_results["total"] += 1
+                    if fault_prediction == test_labels[frequency]:
+                        prediction_results["correct"] += 1
 
                 # Escribir en datalake Silver dependiendo de la predicción
                 match fault_prediction:
@@ -160,3 +181,10 @@ if __name__ == "__main__":
         for f in files.values():
             f.close()
         consumer.close()
+        correct = prediction_results["correct"]
+        total = prediction_results["total"]
+        if total > 0:
+            precision = correct / total * 100
+            print(f"\nResumen de predicciones sobre test:")
+            print(f"Correctas: {correct}/{total}")
+            print(f"Precisión: {precision:.2f}%")
