@@ -202,7 +202,7 @@ if __name__ == "__main__":
                         writer_raw_data.writerow(payload)
 
             producer.flush()
-            time.sleep(0.5)
+            time.sleep(0.25)
 
     except KeyboardInterrupt:
         print("\n[Producer] Parado por consola (Ctrl+C).")
