@@ -1,0 +1,5 @@
+exp_name,best_pt,imgsz,batch,lr0,epochs_max,patience,accuracy,precision_defecto,recall_defecto,f1_defecto
+exp1_img224_b16_lr0.001_e100_Adam_pat10,C:\Users\User\Documents\GitHub\grupo1reto2\Piezas\Clasificacion\runs_cls\exp1_img224_b16_lr0.001_e100_Adam_pat104\weights\best.pt,224,16,0.001,100,10,0.96875,1.0,0.8,0.8888888888888888
+exp2_img224_b16_lr0.0005_e100_Adam_pat10,C:\Users\User\Documents\GitHub\grupo1reto2\Piezas\Clasificacion\runs_cls\exp2_img224_b16_lr0.0005_e100_Adam_pat104\weights\best.pt,224,16,0.0005,100,10,0.9375,1.0,0.6,0.75
+exp3_img224_b32_lr0.001_e100_Adam_pat10,C:\Users\User\Documents\GitHub\grupo1reto2\Piezas\Clasificacion\runs_cls\exp3_img224_b32_lr0.001_e100_Adam_pat104\weights\best.pt,224,32,0.001,100,10,0.9375,1.0,0.6,0.75
+exp4_img224_b32_lr0.0005_e100_Adam_pat10,C:\Users\User\Documents\GitHub\grupo1reto2\Piezas\Clasificacion\runs_cls\exp4_img224_b32_lr0.0005_e100_Adam_pat104\weights\best.pt,224,32,0.0005,100,10,0.96875,1.0,0.8,0.8888888888888888

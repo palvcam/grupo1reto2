@@ -12,18 +12,15 @@ import time
 import joblib
 import random
 
-# Configuración del productor
+# Configuración del producer
 producer_config = {
     'bootstrap.servers': '127.0.0.1:9092',
 }
 producer = Producer(producer_config)
 
-
-# ------------------------
 # Datalake
-# ------------------------
 
-# Crear carpetas Bronze
+# Crear carpetas
 os.makedirs("datalake/raw", exist_ok=True)
 
 RAW_DATA_FILE = Path("datalake/raw/raw_data.csv")
@@ -33,9 +30,7 @@ writer_raw_data = None
 PATH = Path.cwd()
 DATA_DIR = Path("production")
 
-# ------------------------
 # Parámetros del modelo
-# ------------------------
 FS = 51200
 window_sec = 0.2
 window_size = int(window_sec * FS)      # 10240
@@ -60,9 +55,7 @@ sensor_names = [
 # Cargar top20
 top_features = joblib.load("top20_features_windows.joblib")
 
-# ------------------------
 # Funciones auxiliares
-# ------------------------
 def rpm_from_filename(p: Path) -> float:
     return float(p.stem) * 60.0
 

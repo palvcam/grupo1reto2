@@ -11,7 +11,7 @@ from pathlib import Path
 model = joblib.load('gb_top20_windows_model.pkl')
 print("Modelo cargado desde 'gb_top20_windows_model.pkl'\n")
 
-# Configuración del consumidor
+# Configuración del consumer
 consumer_config = {
     'bootstrap.servers': '127.0.0.1:9092',
     'group.id': 'datalake_processing_group',
@@ -20,7 +20,7 @@ consumer_config = {
 consumer = Consumer(consumer_config)
 consumer.subscribe(['rodamientos'])
 
-# Crear carpetas Silver
+# Crear carpetas
 os.makedirs("datalake/processed/normal", exist_ok=True)
 os.makedirs("datalake/processed/horizontal_misalignment", exist_ok=True)
 os.makedirs("datalake/processed/vertical_misalignment", exist_ok=True)
@@ -122,7 +122,7 @@ if __name__ == "__main__":
                     if fault_prediction == test_labels[frequency]:
                         prediction_results["correct"] += 1
 
-                # Escribir en datalake Silver dependiendo de la predicción
+                # Escribir en datalake dependiendo de la predicción
                 match fault_prediction:
                     case "normal":
                             writer_normal = csv.DictWriter(files["normal"], fieldnames=data.keys())
